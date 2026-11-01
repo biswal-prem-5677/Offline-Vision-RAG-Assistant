@@ -1,0 +1,6 @@
+,Recall@1,Recall@5,Recall@10,Precision@10,mAP@10,vector size,trained on
+Original CNN,59.9,78.8,84.9,52.9,45.7,256,"CIFAR-100, from scratch (45k images)"
+ResNet-18,72.9,81.4,84.5,71.7,68.4,256,"CIFAR-100, from scratch (45k images)"
+ResNet-50 (frozen),62.7,82.8,88.7,52.0,44.2,2048,ImageNet (1.3M images)
+DINOv2 ViT-S/14 (frozen),76.4,90.7,94.2,69.0,63.1,384,LVD-142M images (self-supervised)
+CLIP ViT-B/32 (frozen),65.2,84.4,90.2,56.2,48.6,512,400M image-text pairs

@@ -1,27 +1,12 @@
-"""
-build_index.py
-----------------
-Builds TWO FAISS indexes:
-  1. image_index.faiss  -- vectors from YOUR trained CNN (embedding_model.py)
-                            used for image-to-image search.
-  2. text_index.faiss    -- vectors from a local MiniLM text encoder, one
-                            per image's predicted class name (caption),
-                            used so text queries can still find images.
-
-Only the IMAGE vectorization (#1) needs to be your own trained model.
-The text index (#2) is just for convenience so "search by typing a
-sentence" keeps working; it never touches image pixels.
-
-Usage:
-    python build_index.py --images_dir ./sample_images --out_dir ./index_store
-"""
-
 import os
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
+import config
 import json
-import argparse
+import hashlib
+import time
+import re
 from pathlib import Path
 
 import numpy as np
@@ -31,9 +16,25 @@ from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 
 from embedding_model import load_encoder
+from config import INDEX_DIR, CHECKPOINT_PATH, TEXT_MODEL
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-TEXT_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # local, text-only
+
+
+def compute_md5(filepath: str) -> str:
+    hash_md5 = hashlib.md5()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+
+def extract_clean_name(filename: str) -> str:
+    base = os.path.splitext(filename)[0].lower()
+    if base.startswith("screenshot") or base.startswith("whatsapp"):
+        return ""
+    cleaned = re.sub(r'[\d_-]+', ' ', base).strip()
+    return cleaned
 
 
 def collect_image_paths(images_dir: str):
@@ -45,81 +46,89 @@ def collect_image_paths(images_dir: str):
     return sorted(paths)
 
 
-def build_index(images_dir: str, out_dir: str, checkpoint_path: str):
+def build_index(images_dir: str, checkpoint_path: str = None):
+    if checkpoint_path is None:
+        checkpoint_path = CHECKPOINT_PATH
+    
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    
+    out_dir = INDEX_DIR
     os.makedirs(out_dir, exist_ok=True)
-
-    print("Loading your trained image encoder...")
+    
+    print("Loading image encoder...")
     encoder = load_encoder(checkpoint_path)
-
-    print(f"Loading local text encoder ({TEXT_MODEL_NAME}) for caption matching...")
-    text_model = SentenceTransformer(TEXT_MODEL_NAME)
-
+    
     image_paths = collect_image_paths(images_dir)
     if not image_paths:
         raise ValueError(f"No images found in {images_dir}")
-
-    print(f"Found {len(image_paths)} images. Encoding...")
-
+    
     image_vectors = []
-    captions = []
     metadata = []
-
-    for p in tqdm(image_paths):
+    captions = []
+    
+    for p in tqdm(image_paths, desc="Encoding images with CNN"):
         try:
             img = Image.open(p).convert("RGB")
-        except Exception as e:
-            print(f"Skipping {p}: {e}")
+        except Exception:
             continue
-
+        
         vec, label, confidence = encoder.get_embedding_and_label(img)
+        filename = os.path.basename(p)
+        clean_name = extract_clean_name(filename)
+        
+        text_repr = f"{label} {clean_name}".strip() if clean_name else label
+        
         image_vectors.append(vec)
-        captions.append(label)
-        metadata.append(
-            {
-                "path": os.path.abspath(p),
-                "filename": os.path.basename(p),
-                "caption": label,
-                "confidence": round(confidence, 4),
-            }
-        )
-
+        captions.append(text_repr)
+        metadata.append({
+            "path": p,
+            "filename": filename,
+            "caption": label,
+            "text_repr": text_repr,
+            "confidence": round(confidence, 4),
+        })
+    
     image_vectors = np.vstack(image_vectors).astype("float32")
     faiss.normalize_L2(image_vectors)
     image_index = faiss.IndexFlatIP(image_vectors.shape[1])
     image_index.add(image_vectors)
-
-    print("Encoding captions with the local text model...")
+    
+    print(f"Loading text encoder ({TEXT_MODEL})...")
+    text_model = SentenceTransformer(TEXT_MODEL)
     text_vectors = text_model.encode(captions, convert_to_numpy=True).astype("float32")
     faiss.normalize_L2(text_vectors)
     text_index = faiss.IndexFlatIP(text_vectors.shape[1])
     text_index.add(text_vectors)
-
+    
     faiss.write_index(image_index, os.path.join(out_dir, "image_index.faiss"))
     faiss.write_index(text_index, os.path.join(out_dir, "text_index.faiss"))
+    
     with open(os.path.join(out_dir, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
+    
+    config_info = {
+        "checkpoint_path": os.path.abspath(checkpoint_path),
+        "text_model_name": TEXT_MODEL,
+        "embedding_dim": int(image_vectors.shape[1]),
+        "text_dim": int(text_vectors.shape[1]),
+        "count": len(metadata),
+        "checkpoint_mtime": os.path.getmtime(checkpoint_path),
+        "checkpoint_md5": compute_md5(checkpoint_path),
+        "build_time": time.time(),
+    }
+    
     with open(os.path.join(out_dir, "config.json"), "w") as f:
-        json.dump(
-            {
-                "checkpoint_path": os.path.abspath(checkpoint_path),
-                "text_model_name": TEXT_MODEL_NAME,
-                "image_dim": int(image_vectors.shape[1]),
-                "text_dim": int(text_vectors.shape[1]),
-                "count": len(metadata),
-            },
-            f,
-            indent=2,
-        )
-
-    print(f"Done. Indexed {len(metadata)} images.")
+        json.dump(config_info, f, indent=2)
+    
+    print(f"Done. Indexed {len(metadata)} images (image vectors: {image_index.ntotal}, text vectors: {text_index.ntotal}).")
     print(f"Saved to: {out_dir}")
 
 
 if __name__ == "__main__":
+    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--images_dir", type=str, required=True)
-    parser.add_argument("--out_dir", type=str, default="./index_store")
-    parser.add_argument("--checkpoint_path", type=str, default="embedding_model.pth")
+    parser.add_argument("--checkpoint_path", type=str, default=CHECKPOINT_PATH)
     args = parser.parse_args()
-
-    build_index(args.images_dir, args.out_dir, args.checkpoint_path)
+    build_index(args.images_dir, args.checkpoint_path)
